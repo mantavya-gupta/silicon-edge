@@ -6,27 +6,24 @@
 #include <algorithm>
 
 struct ModelConfig {
-    int hidden_size;
-    int num_layers;
-    int num_heads;
-    int vocab_size;
+    int hidden_size, num_layers, num_heads, num_kv_heads, vocab_size;
     int head_dim() const { return hidden_size / num_heads; }
+    int kv_dim()   const { return head_dim() * num_kv_heads; }
 };
 
 struct Q4Matrix {
     std::vector<uint8_t> data;
-    std::vector<float>   scales;
+    std::vector<float> scales;
     int rows, cols;
-
     void matmul(const float* input, float* output) const {
         for (int r = 0; r < rows; r++) {
-            float sum = 0.0f;
-            float scale = scales[r];
+            float sum = 0.0f, scale = scales[r];
             const uint8_t* row = data.data() + r * (cols / 2);
             for (int i = 0; i < cols / 2; i++) {
-                uint8_t packed = row[i];
-                int8_t w0 = (int8_t)((packed & 0x0F) << 4) >> 4;
-                int8_t w1 = (int8_t)(packed & 0xF0) >> 4;
+                uint8_t p = row[i];
+                // Correct sign extension for 4-bit signed integers
+                int8_t w0 = (int8_t)(p << 4) >> 4;  // lower nibble
+                int8_t w1 = (int8_t)(p) >> 4;        // upper nibble
                 sum += (float)w0 * input[2*i] + (float)w1 * input[2*i+1];
             }
             output[r] = sum * scale;
@@ -36,15 +33,14 @@ struct Q4Matrix {
 
 struct KVCache {
     std::vector<float> keys, vals;
-    int head_dim, max_pos = 0;
-    KVCache(int hd, int max_seq) : head_dim(hd), keys(max_seq*hd), vals(max_seq*hd) {}
+    int kv_dim;
+    KVCache(int kd, int max_seq) : kv_dim(kd), keys(max_seq*kd), vals(max_seq*kd) {}
     void push(const float* k, const float* v, int pos) {
-        std::copy(k, k+head_dim, keys.data()+pos*head_dim);
-        std::copy(v, v+head_dim, vals.data()+pos*head_dim);
-        max_pos = pos+1;
+        std::copy(k, k+kv_dim, keys.data()+pos*kv_dim);
+        std::copy(v, v+kv_dim, vals.data()+pos*kv_dim);
     }
-    const float* key(int pos) const { return keys.data()+pos*head_dim; }
-    const float* val(int pos) const { return vals.data()+pos*head_dim; }
+    const float* key(int pos) const { return keys.data()+pos*kv_dim; }
+    const float* val(int pos) const { return vals.data()+pos*kv_dim; }
 };
 
 struct TransformerLayer {
@@ -56,8 +52,6 @@ struct TransformerLayer {
 struct LlamaModel {
     ModelConfig cfg;
     std::vector<TransformerLayer> layers;
-    std::vector<float> embed_tokens;
-    std::vector<float> lm_head;
-    std::vector<float> norm;
+    std::vector<float> embed_tokens, lm_head, norm;
     static LlamaModel load(const std::string& path);
 };

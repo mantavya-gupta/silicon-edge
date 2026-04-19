@@ -5,73 +5,85 @@
 #include <chrono>
 #include <vector>
 #include <numeric>
-#include <cstring>
+#include <sstream>
+#include <cmath>
+#include <random>
 
-int main(int argc, char* argv[]) {
-    std::string weights = "weights/model.bin";
-    int max_tokens = 128;
-    int runs = 5;
+int sample_topp(const std::vector<float>& logits, float temperature, float topp, std::mt19937& rng){
+    int n=logits.size();
+    std::vector<float> probs(n);
+    float mx=*std::max_element(logits.begin(),logits.end()),sum=0;
+    for(int i=0;i<n;i++){probs[i]=expf((logits[i]-mx)/temperature);sum+=probs[i];}
+    for(int i=0;i<n;i++) probs[i]/=sum;
+    std::vector<int> idx(n); std::iota(idx.begin(),idx.end(),0);
+    std::sort(idx.begin(),idx.end(),[&](int a,int b){return probs[a]>probs[b];});
+    float cumsum=0; int last=0;
+    for(int i=0;i<n;i++){cumsum+=probs[idx[i]];last=i;if(cumsum>=topp)break;}
+    std::uniform_real_distribution<float> dist(0,cumsum);
+    float r=dist(rng),running=0;
+    for(int i=0;i<=last;i++){running+=probs[idx[i]];if(running>=r)return idx[i];}
+    return idx[0];
+}
 
-    for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--weights" && i+1 < argc) weights = argv[++i];
-        if (std::string(argv[i]) == "--max-tokens" && i+1 < argc) max_tokens = std::stoi(argv[++i]);
-        if (std::string(argv[i]) == "--runs" && i+1 < argc) runs = std::stoi(argv[++i]);
-    }
+int main(int argc,char* argv[]){
+    std::string weights="weights/model.bin";
+    int max_tokens=20; float temperature=0.1f,topp=0.9f;
+    std::vector<int> prompt_tokens={1};
 
-    std::cout << "Loading model from " << weights << "...\n";
-    LlamaModel model = LlamaModel::load(weights);
-    auto& cfg = model.cfg;
-    std::cout << "Config: hidden=" << cfg.hidden_size
-              << "  layers=" << cfg.num_layers
-              << "  heads=" << cfg.num_heads
-              << "  vocab=" << cfg.vocab_size << "\n";
-
-    std::vector<double> tps_results;
-
-    for (int run = 0; run < runs; run++) {
-        KVCache kv(cfg.head_dim(), max_tokens + 10);
-        std::vector<float> x(cfg.hidden_size);
-        std::vector<float> x_out(cfg.hidden_size);
-
-        // Start from token 1 (BOS)
-        int token = 1;
-        auto t0 = std::chrono::high_resolution_clock::now();
-
-        for (int pos = 0; pos < max_tokens; pos++) {
-            // Embed
-            const float* emb = model.embed_tokens.data() + token * cfg.hidden_size;
-            std::copy(emb, emb + cfg.hidden_size, x.data());
-
-            // Forward through layers
-            for (auto& layer : model.layers)
-                layer_forward(layer, x.data(), x_out.data(), kv, pos, cfg);
-
-            // Final norm + lm_head (argmax)
-            std::vector<float> normed(cfg.hidden_size);
-            rmsnorm(x_out.data(), model.norm.data(), normed.data(), cfg.hidden_size);
-
-            std::vector<float> logits(cfg.vocab_size);
-            for (int v = 0; v < cfg.vocab_size; v++) {
-                float dot = 0.0f;
-                const float* row = model.lm_head.data() + v * cfg.hidden_size;
-                for (int d = 0; d < cfg.hidden_size; d++) dot += row[d] * normed[d];
-                logits[v] = dot;
-            }
-            token = std::max_element(logits.begin(), logits.end()) - logits.begin();
-            std::copy(x_out.begin(), x_out.end(), x.begin());
+    for(int i=1;i<argc;i++){
+        if(std::string(argv[i])=="--weights"&&i+1<argc) weights=argv[++i];
+        if(std::string(argv[i])=="--max-tokens"&&i+1<argc) max_tokens=std::stoi(argv[++i]);
+        if(std::string(argv[i])=="--temperature"&&i+1<argc) temperature=std::stof(argv[++i]);
+        if(std::string(argv[i])=="--prompt-tokens"&&i+1<argc){
+            prompt_tokens.clear();
+            std::stringstream ss(argv[++i]); std::string tok;
+            while(std::getline(ss,tok,',')) prompt_tokens.push_back(std::stoi(tok));
         }
-
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double elapsed = std::chrono::duration<double>(t1 - t0).count();
-        double tps = max_tokens / elapsed;
-        tps_results.push_back(tps);
-        std::cout << "Run " << run+1 << ": " << (int)tps << " tok/s\n";
     }
 
-    double avg = std::accumulate(tps_results.begin(), tps_results.end(), 0.0) / runs;
-    double mn  = *std::min_element(tps_results.begin(), tps_results.end());
-    double mx  = *std::max_element(tps_results.begin(), tps_results.end());
-    std::cout << "\nAvg: " << (int)avg << " tok/s  |  Min: " << (int)mn << "  |  Max: " << (int)mx << "\n";
-    std::cout << "tokens_generated:" << max_tokens << "\n";
+    std::cout<<"Loading model...\n";
+    LlamaModel model=LlamaModel::load(weights);
+    auto& cfg=model.cfg;
+    std::cout<<"Config: hidden="<<cfg.hidden_size<<" layers="<<cfg.num_layers
+             <<" heads="<<cfg.num_heads<<" kv_heads="<<cfg.num_kv_heads
+             <<" vocab="<<cfg.vocab_size<<"\n";
+
+    std::mt19937 rng(42);
+    KVCache kv(cfg.kv_dim(),prompt_tokens.size()+max_tokens+10);
+    std::vector<float> x(cfg.hidden_size),x_out(cfg.hidden_size);
+    std::vector<int> all_tokens=prompt_tokens;
+
+    auto t0=std::chrono::high_resolution_clock::now();
+
+    for(int pos=0;pos<(int)(prompt_tokens.size()+max_tokens);pos++){
+        int token=(pos<(int)prompt_tokens.size())?prompt_tokens[pos]:all_tokens.back();
+        const float* emb=model.embed_tokens.data()+token*cfg.hidden_size;
+        std::copy(emb,emb+cfg.hidden_size,x.data());
+        for(auto& layer:model.layers) layer_forward(layer,x.data(),x_out.data(),kv,pos,cfg);
+
+        if(pos>=(int)prompt_tokens.size()-1){
+            std::vector<float> normed(cfg.hidden_size);
+            rmsnorm(x_out.data(),model.norm.data(),normed.data(),cfg.hidden_size);
+            std::vector<float> logits(cfg.vocab_size);
+            for(int v=0;v<cfg.vocab_size;v++){
+                float dot=0; const float* row=model.lm_head.data()+v*cfg.hidden_size;
+                for(int d=0;d<cfg.hidden_size;d++) dot+=row[d]*normed[d];
+                logits[v]=dot;
+            }
+            int next=sample_topp(logits,temperature,topp,rng);
+            all_tokens.push_back(next);
+            if(next==2) break;
+        }
+        std::copy(x_out.begin(),x_out.end(),x.begin());
+    }
+
+    auto t1=std::chrono::high_resolution_clock::now();
+    double elapsed=std::chrono::duration<double>(t1-t0).count();
+    int generated=all_tokens.size()-prompt_tokens.size();
+    std::cout<<"output_tokens:";
+    for(int i=prompt_tokens.size();i<(int)all_tokens.size();i++)
+        std::cout<<all_tokens[i]<<",";
+    std::cout<<"\n"<<generated<<" tokens in "<<(int)elapsed<<"s = "
+             <<(int)(generated/elapsed)<<" tok/s\n";
     return 0;
 }
