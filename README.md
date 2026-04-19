@@ -60,6 +60,18 @@ SwiGLU FFN — feed-forward block uses gated activation: FFN(x) = SiLU(gate(x)) 
 
 Warp-shuffle CUDA reduction — uses __shfl_down_sync for intra-warp dot product accumulation, avoiding shared memory overhead.
 
+
+## GPU Benchmark (Nvidia Tesla T4 — CUDA)
+
+| Matrix Size | Time (µs/call) | Throughput |
+|-------------|---------------|------------|
+| 128 × 128   | 5.61 µs       | 5.8 GFLOP/s  |
+| 256 × 256   | 6.72 µs       | 19.5 GFLOP/s |
+| 512 × 512   | 10.89 µs      | 48.1 GFLOP/s |
+
+Hardware: Nvidia Tesla T4 (Google Colab), custom warp-shuffle int4 CUDA kernel.
+Kernel: one block per output row, 128 threads, warp-level reduction via __shfl_down_sync.
+
 ## Limitations & Future Work
 
 - Real Llama-3 weights (currently synthetic)
