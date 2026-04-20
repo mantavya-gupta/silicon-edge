@@ -4,13 +4,12 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
-
 struct ModelConfig {
     int hidden_size, num_layers, num_heads, num_kv_heads, vocab_size;
+    float rope_theta = 500000.0f;
     int head_dim() const { return hidden_size / num_heads; }
     int kv_dim()   const { return head_dim() * num_kv_heads; }
 };
-
 struct Q4Matrix {
     std::vector<uint8_t> data;
     std::vector<float> scales;
@@ -21,16 +20,14 @@ struct Q4Matrix {
             const uint8_t* row = data.data() + r * (cols / 2);
             for (int i = 0; i < cols / 2; i++) {
                 uint8_t p = row[i];
-                // Correct sign extension for 4-bit signed integers
-                int8_t w0 = (int8_t)(p << 4) >> 4;  // lower nibble
-                int8_t w1 = (int8_t)(p) >> 4;        // upper nibble
+                int8_t w0 = (int8_t)(p << 4) >> 4;
+                int8_t w1 = (int8_t)(p) >> 4;
                 sum += (float)w0 * input[2*i] + (float)w1 * input[2*i+1];
             }
             output[r] = sum * scale;
         }
     }
 };
-
 struct KVCache {
     std::vector<float> keys, vals;
     int kv_dim;
@@ -42,13 +39,11 @@ struct KVCache {
     const float* key(int pos) const { return keys.data()+pos*kv_dim; }
     const float* val(int pos) const { return vals.data()+pos*kv_dim; }
 };
-
 struct TransformerLayer {
     Q4Matrix q_proj, k_proj, v_proj, o_proj;
     Q4Matrix gate_proj, up_proj, down_proj;
     std::vector<float> input_norm, post_attn_norm;
 };
-
 struct LlamaModel {
     ModelConfig cfg;
     std::vector<TransformerLayer> layers;

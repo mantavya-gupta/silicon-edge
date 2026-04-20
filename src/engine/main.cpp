@@ -29,7 +29,6 @@ int main(int argc,char* argv[]){
     std::string weights="weights/model.bin";
     int max_tokens=20; float temperature=0.1f,topp=0.9f;
     std::vector<int> prompt_tokens={1};
-
     for(int i=1;i<argc;i++){
         if(std::string(argv[i])=="--weights"&&i+1<argc) weights=argv[++i];
         if(std::string(argv[i])=="--max-tokens"&&i+1<argc) max_tokens=std::stoi(argv[++i]);
@@ -40,17 +39,17 @@ int main(int argc,char* argv[]){
             while(std::getline(ss,tok,',')) prompt_tokens.push_back(std::stoi(tok));
         }
     }
-
     std::cout<<"Loading model...\n";
     LlamaModel model=LlamaModel::load(weights);
     auto& cfg=model.cfg;
     std::cout<<"Config: hidden="<<cfg.hidden_size<<" layers="<<cfg.num_layers
              <<" heads="<<cfg.num_heads<<" kv_heads="<<cfg.num_kv_heads
-             <<" vocab="<<cfg.vocab_size<<"\n";
+             <<" vocab="<<cfg.vocab_size<<" rope_theta="<<cfg.rope_theta<<"\n";
 
     std::mt19937 rng(42);
-    KVCache kv(cfg.kv_dim(),prompt_tokens.size()+max_tokens+10);
-    std::vector<float> x(cfg.hidden_size),x_out(cfg.hidden_size);
+    int max_seq=prompt_tokens.size()+max_tokens+10;
+    std::vector<KVCache> kv_caches(cfg.num_layers, KVCache(cfg.kv_dim(),max_seq));
+    std::vector<float> x(cfg.hidden_size), x_out(cfg.hidden_size);
     std::vector<int> all_tokens=prompt_tokens;
 
     auto t0=std::chrono::high_resolution_clock::now();
@@ -59,11 +58,16 @@ int main(int argc,char* argv[]){
         int token=(pos<(int)prompt_tokens.size())?prompt_tokens[pos]:all_tokens.back();
         const float* emb=model.embed_tokens.data()+token*cfg.hidden_size;
         std::copy(emb,emb+cfg.hidden_size,x.data());
-        for(auto& layer:model.layers) layer_forward(layer,x.data(),x_out.data(),kv,pos,cfg);
+
+        // THE FIX: copy x_out -> x after EACH layer so layers are chained
+        for(int l=0;l<(int)model.layers.size();l++){
+            layer_forward(model.layers[l],x.data(),x_out.data(),kv_caches[l],pos,cfg);
+            std::copy(x_out.begin(),x_out.end(),x.begin()); // <-- this was missing inside loop
+        }
 
         if(pos>=(int)prompt_tokens.size()-1){
             std::vector<float> normed(cfg.hidden_size);
-            rmsnorm(x_out.data(),model.norm.data(),normed.data(),cfg.hidden_size);
+            rmsnorm(x.data(),model.norm.data(),normed.data(),cfg.hidden_size);
             std::vector<float> logits(cfg.vocab_size);
             for(int v=0;v<cfg.vocab_size;v++){
                 float dot=0; const float* row=model.lm_head.data()+v*cfg.hidden_size;
@@ -72,9 +76,8 @@ int main(int argc,char* argv[]){
             }
             int next=sample_topp(logits,temperature,topp,rng);
             all_tokens.push_back(next);
-            if(next==2) break;
+            if(next==2||next==128001) break;
         }
-        std::copy(x_out.begin(),x_out.end(),x.begin());
     }
 
     auto t1=std::chrono::high_resolution_clock::now();
